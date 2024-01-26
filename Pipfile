@@ -4,11 +4,15 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-psycopg2-binary = "*"
 tqdm = "*"
 requests = "*"
+apscheduler = "*"
+psycopg = {version = "*", extras = ["binary", "pool"]}
+backoff = "*"
 
 [dev-packages]
+pre-commit = "*"
+csvkit = "*"
 
 [requires]
 python_version = "3.11.5"

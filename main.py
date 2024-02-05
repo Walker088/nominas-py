@@ -1,6 +1,8 @@
+import csv
 import io
 import traceback
 import zipfile
+from typing import IO
 
 import backoff
 import requests
@@ -8,7 +10,8 @@ from tqdm import tqdm
 
 from nominas.config.config import app_config
 from nominas.logger.logger import logger
-from nominas.postgres.postgres import nomina_pool_manager
+from nominas.storage.clickhouse import ch_client_mgr
+from nominas.storage.postgres import pgpool_mgr
 
 log = logger().getLogger("Main")
 
@@ -19,23 +22,17 @@ log = logger().getLogger("Main")
     max_time=60,
     max_tries=5,
 )
-def get(dest: str):
+def backoff_get(dest: str):
     return requests.get(dest)
 
 
-def download_zip_to_pg(pbar: tqdm, anio_mes: str):
-    pbar.set_description(f"downloading nomina_{anio_mes}.zip")
-    rq = get(f"https://datos.hacienda.gov.py/odmh-core/rest/nomina/datos/nomina_{anio_mes}.zip")
-    pbar.set_description("reading zip file")
-    zf = zipfile.ZipFile(io.BytesIO(rq.content))
-    pbar.set_description("reading csv file")
-    with zf.open(f"nomina_{anio_mes}.csv", "r") as csv_file:
-        with nomina_pool_manager.pool.connection() as conn:
-            with conn.cursor() as cur:
-                try:
-                    pbar.set_description(f"[{anio_mes}]creating tmp table")
-                    cur.execute(
-                        """
+def download_zip_to_pg(pbar: tqdm, anio_mes: str, csv_file: IO[bytes]):
+    with pgpool_mgr.pool.connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                pbar.set_description(f"[{anio_mes}] creating tmp table")
+                cur.execute(
+                    """
                     CREATE TEMP TABLE tmp_nomina_csv_raw (
                         anio INT4,
                         mes INT4,
@@ -79,16 +76,16 @@ def download_zip_to_pg(pbar: tqdm, anio_mes: str):
                         "unidadAbr" TEXT
                     ) ON COMMIT DROP
                     """
-                    )
-                    pbar.set_description(f"[{anio_mes}] created tmp_nomina_csv_raw")
-                    pbar.set_description(f"[{anio_mes}] created tmp_nomina_csv_raw")
-                    with cur.copy(
-                        "COPY tmp_nomina_csv_raw FROM STDIN DELIMITER ',' CSV HEADER ENCODING 'iso-8859-1'"
-                    ) as copy:
-                        copy.write(csv_file.read())
-                    pbar.set_description(f"[{anio_mes}] loaded csv to tmp_nomina_csv_raw")
-                    cur.execute(
-                        """
+                )
+                pbar.set_description(f"[{anio_mes}] created tmp_nomina_csv_raw")
+                pbar.set_description(f"[{anio_mes}] created tmp_nomina_csv_raw")
+                with cur.copy(
+                    "COPY tmp_nomina_csv_raw FROM STDIN DELIMITER ',' CSV HEADER ENCODING 'iso-8859-1'"
+                ) as copy:
+                    copy.write(csv_file.read())
+                pbar.set_description(f"[{anio_mes}] loaded csv to tmp_nomina_csv_raw")
+                cur.execute(
+                    """
                     INSERT INTO py_personas (
                     	codigo_persona,
                     	nombres,
@@ -116,10 +113,10 @@ def download_zip_to_pg(pbar: tqdm, anio_mes: str):
                     	tmp_nomina_csv_raw nc
                     ON CONFLICT DO NOTHING
                     """
-                    )
-                    pbar.set_description(f"[{anio_mes}] loaded to py_personas")
-                    cur.execute(
-                        """
+                )
+                pbar.set_description(f"[{anio_mes}] loaded to py_personas")
+                cur.execute(
+                    """
                     INSERT INTO py_nomina_funcionarios_publicos_niveles (
                     	codigo_nivel,
                     	nivel_abr,
@@ -139,10 +136,10 @@ def download_zip_to_pg(pbar: tqdm, anio_mes: str):
                         DO UPDATE SET
                         	descripcion_nivel = EXCLUDED.descripcion_nivel
                     """
-                    )
-                    pbar.set_description(f"[{anio_mes}] loaded to niveles")
-                    cur.execute(
-                        """
+                )
+                pbar.set_description(f"[{anio_mes}] loaded to niveles")
+                cur.execute(
+                    """
                     INSERT INTO py_nomina_funcionarios_publicos_entidades (
                     	codigo_entidad,
                     	entidad_abr,
@@ -161,10 +158,10 @@ def download_zip_to_pg(pbar: tqdm, anio_mes: str):
                         DO UPDATE SET
                         	descripcion_entidad = EXCLUDED.descripcion_entidad
                     """
-                    )
-                    pbar.set_description(f"[{anio_mes}] loaded to entidades")
-                    cur.execute(
-                        """
+                )
+                pbar.set_description(f"[{anio_mes}] loaded to entidades")
+                cur.execute(
+                    """
                     INSERT INTO py_nomina_funcionarios_publicos_programas (
                     		hash_id,
                         	codgio_programa,
@@ -208,10 +205,10 @@ def download_zip_to_pg(pbar: tqdm, anio_mes: str):
                     	TRIM(nc."descripcionSubprograma")
                     ON CONFLICT (hash_id) DO NOTHING
                     """
-                    )
-                    pbar.set_description(f"[{anio_mes}] loaded to programas")
-                    cur.execute(
-                        """
+                )
+                pbar.set_description(f"[{anio_mes}] loaded to programas")
+                cur.execute(
+                    """
                     INSERT INTO py_nomina_funcionarios_publicos_proyectos (
                     hash_id,
                     	codigo_proyecto,
@@ -243,10 +240,10 @@ def download_zip_to_pg(pbar: tqdm, anio_mes: str):
                     	TRIM(nc."descripcionProyecto")
                     ON CONFLICT (hash_id) DO NOTHING
                     """
-                    )
-                    pbar.set_description(f"[{anio_mes}] loaded to proyectos")
-                    cur.execute(
-                        """
+                )
+                pbar.set_description(f"[{anio_mes}] loaded to proyectos")
+                cur.execute(
+                    """
                     INSERT INTO py_nomina_funcionarios_publicos_unidades_responsables (
                     	hash_id,
                         	codigo_unidad_responsable,
@@ -274,10 +271,10 @@ def download_zip_to_pg(pbar: tqdm, anio_mes: str):
                     	TRIM(nc."descripcionUnidadResponsable")
                     ON CONFLICT (hash_id) DO NOTHING
                     """
-                    )
-                    pbar.set_description(f"[{anio_mes}] loaded to unidades")
-                    cur.execute(
-                        """
+                )
+                pbar.set_description(f"[{anio_mes}] loaded to unidades")
+                cur.execute(
+                    """
                     INSERT INTO py_nomina_funcionarios_publicos_objecto_gasto (
                     	codigo_objecto_gasto,
                     	concepto_gasto
@@ -301,10 +298,10 @@ def download_zip_to_pg(pbar: tqdm, anio_mes: str):
                         	    END
                             )
                     """
-                    )
-                    pbar.set_description(f"[{anio_mes}] loaded to objecto_gastos")
-                    cur.execute(
-                        """
+                )
+                pbar.set_description(f"[{anio_mes}] loaded to objecto_gastos")
+                cur.execute(
+                    """
                     INSERT INTO py_nomina_funcionarios_publicos (
                         payment_id,
                     	anio,
@@ -498,23 +495,36 @@ def download_zip_to_pg(pbar: tqdm, anio_mes: str):
                     	tmp_nomina_csv_raw nc
                     ON CONFLICT (check_sum) DO NOTHING
                     """
-                    )
-                    pbar.set_description(f"[{anio_mes}] loaded to nominas")
-                except Exception as e:
-                    print(e)
+                )
+                pbar.set_description(f"[{anio_mes}] loaded to nominas")
+            except Exception as e:
+                print(e)
+
+
+def download_zip_to_clickhouse(pbar: tqdm, anio_mes: str, csv_file: IO[bytes]):
+    pass
 
 
 def sync_data_from_hecienda_py(dest: str):
     try:
         log.info(f"Staring to sync data from {dest} to postgres...")
-        rq = get(dest=dest)
+        rq = backoff_get(dest=dest)
         if rq.status_code != 200:
             log.error(f"the hacienda api is not working well: [{rq.status_code}] {rq.text}")
             return
         available_data = rq.json()
         if isinstance(available_data, list):
             for item in (pbar := tqdm(available_data)):
-                download_zip_to_pg(pbar, item["periodo"])
+                anio_mes = item["periodo"]
+                pbar.set_description(f"downloading nomina_{anio_mes}.zip")
+                rq = backoff_get(
+                    f"https://datos.hacienda.gov.py/odmh-core/rest/nomina/datos/nomina_{anio_mes}.zip"
+                )
+                pbar.set_description("reading zip file")
+                with zipfile.ZipFile(io.BytesIO(rq.content)) as zf:
+                    pbar.set_description("reading csv file")
+                    with zf.open(f"nomina_{anio_mes}.csv", "r") as csv_file:
+                        download_zip_to_pg(pbar, anio_mes, csv_file)
         else:
             log.error(
                 f"the response of the hacienda api is not a list of zip files: [{rq.status_code}] {rq.text}"
@@ -525,10 +535,30 @@ def sync_data_from_hecienda_py(dest: str):
         log.error(f"Error occured upon synchronizing data from hacienda api: {e}")
 
 
+def test_clickhoust():
+    with zipfile.ZipFile("nomina-2023-11.zip", mode="r") as zf:
+        with zf.open(f"nomina_2023-11.csv", "r") as csv_file:
+            reader = csv.reader(io.TextIOWrapper(csv_file, 'iso-8859-1'))
+            read = 0
+            read_max = 10
+            for row in reader:
+                print(row)
+                read += 1
+                if read > read_max:
+                    break
+
+
 if __name__ == '__main__':
-    try:
-        log.info("Welcome to nominas-py")
-        nomina_pool_manager.start(app_config.pg.to_conn_str())
-        sync_data_from_hecienda_py(app_config.nominas.resource)
-    finally:
-        nomina_pool_manager.teardown()
+    log.info("Welcome to nominas-py")
+    if app_config.pg is not None:
+        try:
+            pgpool_mgr.start(app_config.pg.to_conn_str())
+            sync_data_from_hecienda_py(app_config.nominas.resource)
+        finally:
+            pgpool_mgr.teardown()
+    elif app_config.ch is not None:
+        try:
+            ch_client_mgr.start(app_config.ch)
+            test_clickhoust()
+        finally:
+            ch_client_mgr.teardown()

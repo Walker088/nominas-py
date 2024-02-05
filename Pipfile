@@ -9,6 +9,7 @@ requests = "*"
 apscheduler = "*"
 psycopg = {version = "*", extras = ["binary", "pool"]}
 backoff = "*"
+clickhouse-connect = "*"
 
 [dev-packages]
 pre-commit = "*"

@@ -32,8 +32,11 @@ class NominaPgPool:
         self.log.info("Connection pool started")
 
     def teardown(self):
+        if self._pool is None:
+            self.log.info("Pool had been stopped already, do nothing")
+            return
         self._pool.close()
         self.log.info("Connection pool shutted down")
 
 
-nomina_pool_manager = NominaPgPool()
+pgpool_mgr = NominaPgPool()

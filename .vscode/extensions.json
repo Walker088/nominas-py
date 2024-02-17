@@ -1,0 +1,18 @@
+{
+    "recommendations": [
+        "ms-python.black-formatter",
+        "ms-python.isort",
+        "IronGeek.vscode-env",
+        "tamasfe.even-better-toml",
+        "mhutchie.git-graph",
+        "eamodio.gitlens",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "donjayamanne.python-environment-manager",
+        "frhtylcn.pythonsnippets",
+        "njpwerner.autodocstring",
+        "njqdev.vscode-python-typehint",
+        "VisualStudioExptTeam.vscodeintellicode",
+        "KevinRose.vsc-python-indent"
+    ]
+}

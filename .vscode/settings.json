@@ -1,7 +1,6 @@
 {
     "python.analysis.typeCheckingMode": "basic",
     "python.analysis.autoImportCompletions": true,
-    "black-formatter.args": ["--line-length", "100"],
     "[python]": {
         "editor.defaultFormatter": "ms-python.black-formatter",
         "diffEditor.ignoreTrimWhitespace": false,
@@ -13,5 +12,16 @@
         "editor.codeActionsOnSave": {
             "source.organizeImports": "explicit"
         },
-    }
+    },
+    "isort.check": true,
+    "isort.args":[
+        "--src=${workspaceFolder}",
+        "--line-length=100",
+        "--profile",
+        "black"
+    ],
+    "black-formatter.args": [
+        "--line-length=100",
+        "--skip-string-normalization"
+    ],
 }

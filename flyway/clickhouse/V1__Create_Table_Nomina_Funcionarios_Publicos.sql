@@ -1,29 +1,29 @@
 CREATE TABLE IF NOT EXISTS py_hacienda_pub_officers (
     codigo_evento String, -- {anio}{mes}-{codigo_persona}
-    orden UInt8,
-    anio UInt8,
-    mes UInt8,
+    orden UInt32,
+    anio UInt32,
+    mes UInt32,
     codigo_persona String,
     discapacidad Nullable(Boolean),
-    nivil_key Nullable(String),
+    nivel_key Nullable(String),
     entidad_key Nullable(String),
     programa_key Nullable(String),
     proyecto_key Nullable(String),
     unidad_responsable_key Nullable(String),
-    codigo_objeto_gasto String,
-    fuente_financiamiento String,
-    linea String,
-    codigo_categoria String,
-    cargo String,
-    horas_catedra UInt32,
-    fecha_ingreso Date,
-    tipo_profesional String,
-    lugar String,
-    monto_presupuestado UInt64,
-    monto_devengado UInt64,
-    anio_corte UInt8,
-    mes_corte UInt8,
-    fecha_corte Date
+    codigo_objeto_gasto Nullable(UInt32),
+    fuente_financiamiento Nullable(String),
+    linea Nullable(String),
+    codigo_categoria Nullable(String),
+    cargo Nullable(String),
+    horas_catedra Nullable(UInt32),
+    fecha_ingreso Nullable(Date32),
+    tipo_personal Nullable(String),
+    lugar Nullable(String),
+    monto_presupuestado Nullable(UInt128),
+    monto_devengado Nullable(UInt128),
+    anio_corte Nullable(UInt32),
+    mes_corte Nullable(UInt32),
+    fecha_corte Nullable(Date32)
 )
 ENGINE = MergeTree()
 ORDER BY (codigo_evento, orden);
@@ -39,49 +39,49 @@ ENGINE = MergeTree()
 ORDER BY (codigo_persona);
 
 CREATE TABLE IF NOT EXISTS py_hacienda_pub_officers_niveles (
-    nivil_key String, -- {codigo_nivel}_{nivel_abr}
-    codigo_nivel UInt8,
+    nivel_key String, -- {codigo_nivel}-{nivel_abr}
+    codigo_nivel UInt32,
     nivel_abr String,
-    descripcion_nivel Nullable(String)
+    desc_nivel Nullable(String)
 )
 ENGINE = MergeTree()
-ORDER BY (nivil_key);
+ORDER BY (nivel_key);
 
 CREATE TABLE IF NOT EXISTS py_hacienda_pub_officers_entidades (
-    entidad_key String, -- {codigo_entidad}_{entidad_abr}
-    codigo_entidad UInt8,
+    entidad_key String, -- {codigo_entidad}-{entidad_abr}
+    codigo_entidad UInt32,
     entidad_abr String,
-    descripcion_entidad Nullable(String)
+    desc_entidad Nullable(String)
 )
 ENGINE = MergeTree()
 ORDER BY (entidad_key);
 
 CREATE TABLE IF NOT EXISTS py_hacienda_pub_officers_programas (
-    programa_key String, -- {codgio_programa}_{codigo_sub_programa}_{programa_abr}_{sub_programa_abr}
+    programa_key String, -- {codgio_programa}-{codigo_sub_programa}-{programa_abr}-{sub_programa_abr}
     codgio_programa Nullable(UInt32),
     codigo_sub_programa Nullable(UInt32),
     programa_abr Nullable(String),
     sub_programa_abr Nullable(String),
-    descripcion_programa Nullable(String),
-    descripcion_sub_programa Nullable(String)
+    desc_programa Nullable(String),
+    desc_sub_programa Nullable(String)
 )
 ENGINE = MergeTree()
 ORDER BY (programa_key);
 
 CREATE TABLE IF NOT EXISTS py_hacienda_pub_officers_proyectos (
-    proyecto_key String, -- {codigo_proyecto}_{proyecto_abr}
+    proyecto_key String, -- {codigo_proyecto}-{proyecto_abr}
     codigo_proyecto Nullable(UInt32),
     proyecto_abr Nullable(String),
-    descripcion_proyecto Nullable(String)
+    desc_proyecto Nullable(String)
 )
 ENGINE = MergeTree()
 ORDER BY (proyecto_key);
 
 CREATE TABLE IF NOT EXISTS py_hacienda_pub_officers_responsables (
-    unidad_responsable_key String, -- {codigo_unidad_responsable}_{unidad_responsable_abr}
+    unidad_responsable_key String, -- {codigo_unidad_responsable}-{unidad_responsable_abr}
     codigo_unidad_responsable Nullable(UInt32),
     unidad_responsable_abr Nullable(String),
-    descripcion_unidad_responsable Nullable(String)
+    desc_unidad_responsable Nullable(String)
 )
 ENGINE = MergeTree()
 ORDER BY (unidad_responsable_key);

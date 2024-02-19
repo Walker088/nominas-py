@@ -1,15 +1,51 @@
 import csv
+import hashlib
 import io
 import traceback
 import zipfile
-from typing import IO
+from typing import IO, Set
 
 import backoff
 import requests
+from dacite import from_dict
+from psycopg.rows import dict_row
 from tqdm import tqdm
 
 from nominas.config.config import app_config
 from nominas.logger.logger import logger
+from nominas.pipeline.postprocess.postprocess import insert_download_history
+from nominas.pipeline.postprocess.types import DownloadHistory
+from nominas.pipeline.preprocess.preprocess import (
+    get_saved_entidades,
+    get_saved_niveles,
+    get_saved_objecto_gastos,
+    get_saved_personas,
+    get_saved_programas,
+    get_saved_proyectos,
+    get_saved_pub_officers,
+    get_saved_unidad_responsables,
+    to_entidad,
+    to_nivel,
+    to_objecto_gasto,
+    to_persona,
+    to_programa,
+    to_proyecto,
+    to_pub_officer,
+    to_unidad_responsable,
+)
+from nominas.pipeline.preprocess.types import (
+    Entidad,
+    Nivel,
+    ObjectoGasto,
+    Persona,
+    ProcessedCsvItems,
+    Programa,
+    Proyecto,
+    PubOfficer,
+    RawCsvItem,
+    UnidadResponsable,
+)
+from nominas.pipeline.store.clickhouse import store_to_clickhouse
 from nominas.storage.clickhouse import ch_client_mgr
 from nominas.storage.postgres import pgpool_mgr
 
@@ -26,488 +62,131 @@ def backoff_get(dest: str):
     return requests.get(dest)
 
 
-def download_zip_to_pg(pbar: tqdm, anio_mes: str, csv_file: IO[bytes]):
+def was_file_downloaded(resource_url: str, check_sum: str) -> bool:
+    was_file_downloaded = False
+    query = """
+    SELECT 
+	    EXISTS (
+	    	SELECT
+	    		1
+	    	FROM
+	    		py_nomina_download_history h
+	    	WHERE
+	    		resource_url = %(resource_url)s
+	    		AND check_sum = %(check_sum)s
+	    ) was_file_downloaded
+    """
     with pgpool_mgr.pool.connection() as conn:
-        with conn.cursor() as cur:
-            try:
-                pbar.set_description(f"[{anio_mes}] creating tmp table")
-                cur.execute(
-                    """
-                    CREATE TEMP TABLE tmp_nomina_csv_raw (
-                        anio INT4,
-                        mes INT4,
-                        "codigoNivel" INT4,
-                        "descripcionNivel" TEXT,
-                        "codigoEntidad" INT4,
-                        "descripcionEntidad" TEXT,
-                        "codigoPrograma" INT4,
-                        "descripcionPrograma" TEXT,
-                        "codigoSubprograma" INT4,
-                        "descripcionSubprograma" TEXT,
-                        "codigoProyecto" INT4,
-                        "descripcionProyecto" TEXT,
-                        "codigoUnidadResponsable" INT4,
-                        "descripcionUnidadResponsable" TEXT,
-                        "codigoObjetoGasto" INT4,
-                        "conceptoGasto" TEXT,
-                        "fuenteFinanciamiento" TEXT,
-                        linea TEXT,
-                        "codigoPersona" TEXT,
-                        nombres TEXT,
-                        apellidos TEXT,
-                        sexo TEXT,
-                        discapacidad TEXT,
-                        "codigoCategoria" TEXT,
-                        cargo TEXT,
-                        "horasCatedra" INT4,
-                        "fechaIngreso" TEXT,
-                        "tipoPersonal" TEXT,
-                        lugar TEXT,
-                        "montoPresupuestado" NUMERIC(16, 4),
-                        "montoDevengado" NUMERIC(16, 4),
-                        "mesCorte" INT4,
-                        "anioCorte" INT4,
-                        "fechaCorte" TEXT,
-                        "nivelAbr" TEXT,
-                        "entidadAbr" TEXT,
-                        "programaAbr" TEXT,
-                        "subprogramaAbr" TEXT,
-                        "proyectoAbr" TEXT,
-                        "unidadAbr" TEXT
-                    ) ON COMMIT DROP
-                    """
-                )
-                pbar.set_description(f"[{anio_mes}] created tmp_nomina_csv_raw")
-                pbar.set_description(f"[{anio_mes}] created tmp_nomina_csv_raw")
-                with cur.copy(
-                    "COPY tmp_nomina_csv_raw FROM STDIN DELIMITER ',' CSV HEADER ENCODING 'iso-8859-1'"
-                ) as copy:
-                    copy.write(csv_file.read())
-                pbar.set_description(f"[{anio_mes}] loaded csv to tmp_nomina_csv_raw")
-                cur.execute(
-                    """
-                    INSERT INTO py_personas (
-                    	codigo_persona,
-                    	nombres,
-                    	apellidos,
-                    	sexo,
-                    	discapacidad
-                    )
-                    SELECT
-                    	nc."codigoPersona",
-                    	TRIM(nc.nombres),
-                    	TRIM(nc.apellidos),
-                    	CASE COALESCE(nc.sexo, 'NULL')
-                    		WHEN 'NULL' THEN NULL
-                    		WHEN 'M' THEN 'M'
-                    		WHEN 'F' THEN 'F'
-                    		ELSE LEFT(nc.sexo, 1)
-                    	END,
-                    	CASE COALESCE(nc.discapacidad, 'OTHERS')
-                    		WHEN 'OTHERS' THEN NULL
-                    		WHEN 'N' THEN 'N'
-                    		WHEN 'S' THEN 'Y'
-                    		ELSE LEFT(nc.discapacidad, 1)
-                    	END
-                    FROM
-                    	tmp_nomina_csv_raw nc
-                    ON CONFLICT DO NOTHING
-                    """
-                )
-                pbar.set_description(f"[{anio_mes}] loaded to py_personas")
-                cur.execute(
-                    """
-                    INSERT INTO py_nomina_funcionarios_publicos_niveles (
-                    	codigo_nivel,
-                    	nivel_abr,
-                    	descripcion_nivel
-                    )
-                    SELECT
-                    	nc."codigoNivel",
-                    	TRIM(nc."nivelAbr"),
-                    	TRIM(nc."descripcionNivel")
-                    FROM
-                    	tmp_nomina_csv_raw nc
-                    GROUP BY
-                        nc."codigoNivel",
-                    	TRIM(nc."nivelAbr"),
-                    	TRIM(nc."descripcionNivel")
-                    ON CONFLICT (codigo_nivel, nivel_abr)
-                        DO UPDATE SET
-                        	descripcion_nivel = EXCLUDED.descripcion_nivel
-                    """
-                )
-                pbar.set_description(f"[{anio_mes}] loaded to niveles")
-                cur.execute(
-                    """
-                    INSERT INTO py_nomina_funcionarios_publicos_entidades (
-                    	codigo_entidad,
-                    	entidad_abr,
-                    	descripcion_entidad
-                    )
-                    SELECT
-                    	nc."codigoEntidad",
-                    	trim(nc."entidadAbr"),
-                    	trim(nc."descripcionEntidad")
-                    FROM
-                    	tmp_nomina_csv_raw nc
-                    GROUP BY
-                    	nc."codigoEntidad",
-                    	trim(nc."entidadAbr")
-                    ON CONFLICT (codigo_entidad, entidad_abr)
-                        DO UPDATE SET
-                        	descripcion_entidad = EXCLUDED.descripcion_entidad
-                    """
-                )
-                pbar.set_description(f"[{anio_mes}] loaded to entidades")
-                cur.execute(
-                    """
-                    INSERT INTO py_nomina_funcionarios_publicos_programas (
-                    		hash_id,
-                        	codgio_programa,
-                        	codigo_sub_programa,
-                        	programa_abr,
-                        	sub_programa_abr,
-                        	descripcion_programa,
-                        	descripcion_sub_programa
-                        )
-                    SELECT
-                    	encode(
-                            sha256(
-                    		    convert_to(
-                    		        CONCAT(
-                    			        nc."codigoPrograma"::TEXT,
-                    			        nc."codigoSubprograma"::TEXT,
-                    			        TRIM(nc."programaAbr"),
-                    			        TRIM(nc."subprogramaAbr"),
-                    			        TRIM(nc."descripcionPrograma"),
-                    			        TRIM(nc."descripcionSubprograma")
-                    		        ),
-                                    'UTF8'
-                    		    )
-                    	    ),
-                            'hex'
-                        ),
-                    	nc."codigoPrograma",
-                    	nc."codigoSubprograma",
-                    	TRIM(nc."programaAbr"),
-                    	TRIM(nc."subprogramaAbr"),
-                    	TRIM(nc."descripcionPrograma"),
-                    	TRIM(nc."descripcionSubprograma")
-                    FROM
-                    	tmp_nomina_csv_raw nc
-                    GROUP BY
-                    	nc."codigoPrograma",
-                    	nc."codigoSubprograma",
-                    	TRIM(nc."programaAbr"),
-                    	TRIM(nc."subprogramaAbr"),
-                    	TRIM(nc."descripcionPrograma"),
-                    	TRIM(nc."descripcionSubprograma")
-                    ON CONFLICT (hash_id) DO NOTHING
-                    """
-                )
-                pbar.set_description(f"[{anio_mes}] loaded to programas")
-                cur.execute(
-                    """
-                    INSERT INTO py_nomina_funcionarios_publicos_proyectos (
-                    hash_id,
-                    	codigo_proyecto,
-                    	proyecto_abr,
-                    	descripcion_proyecto
-                    )
-                    SELECT
-                    	encode(
-                            sha256(
-                    		    convert_to(
-                    		        CONCAT(
-                    			        nc."codigoProyecto",
-	                                    TRIM(nc."proyectoAbr"),
-	                                    TRIM(nc."descripcionProyecto")
-                    		        ),
-                                    'UTF8'
-                    		    )
-                    	    ),
-                            'hex'
-                        ),
-                    	nc."codigoProyecto",
-                    	TRIM(nc."proyectoAbr"),
-                    	TRIM(nc."descripcionProyecto")
-                    FROM
-                    	tmp_nomina_csv_raw nc
-                    GROUP BY
-                    	nc."codigoProyecto",
-                    	TRIM(nc."proyectoAbr"),
-                    	TRIM(nc."descripcionProyecto")
-                    ON CONFLICT (hash_id) DO NOTHING
-                    """
-                )
-                pbar.set_description(f"[{anio_mes}] loaded to proyectos")
-                cur.execute(
-                    """
-                    INSERT INTO py_nomina_funcionarios_publicos_unidades_responsables (
-                    	hash_id,
-                        	codigo_unidad_responsable,
-                        	unidad_abr,
-                        	descripcion_unidad_responsable
-                        )
-                    SELECT
-                    	encode(sha256(
-                    		convert_to(
-                    		CONCAT(
-                    			nc."codigoUnidadResponsable",
-                    			TRIM(nc."unidadAbr"),
-                    			TRIM(nc."descripcionUnidadResponsable")
-                    		), 'UTF8'
-                    		)
-                    	), 'hex'),
-                    	nc."codigoUnidadResponsable",
-                    	TRIM(nc."unidadAbr"),
-                    	TRIM(nc."descripcionUnidadResponsable")
-                    FROM
-                    	tmp_nomina_csv_raw nc
-                    GROUP BY
-                    	nc."codigoUnidadResponsable",
-                    	TRIM(nc."unidadAbr"),
-                    	TRIM(nc."descripcionUnidadResponsable")
-                    ON CONFLICT (hash_id) DO NOTHING
-                    """
-                )
-                pbar.set_description(f"[{anio_mes}] loaded to unidades")
-                cur.execute(
-                    """
-                    INSERT INTO py_nomina_funcionarios_publicos_objecto_gasto (
-                    	codigo_objecto_gasto,
-                    	concepto_gasto
-                    )
-                    SELECT
-                    	nc."codigoObjetoGasto",
-                    	TRIM(nc."conceptoGasto")
-                    FROM
-                    	tmp_nomina_csv_raw nc
-                    GROUP BY
-                    	nc."codigoObjetoGasto",
-                    	TRIM(nc."conceptoGasto")
-                    ON CONFLICT (codigo_objecto_gasto)
-                        DO UPDATE SET
-                        	concepto_gasto = (
-                                CASE
-                        		    WHEN py_nomina_funcionarios_publicos_objecto_gasto.concepto_gasto <> EXCLUDED.concepto_gasto
-                        		    	THEN CONCAT(py_nomina_funcionarios_publicos_objecto_gasto.concepto_gasto, '/', EXCLUDED.concepto_gasto)
-                        		    ELSE
-                        		    	py_nomina_funcionarios_publicos_objecto_gasto.concepto_gasto
-                        	    END
-                            )
-                    """
-                )
-                pbar.set_description(f"[{anio_mes}] loaded to objecto_gastos")
-                cur.execute(
-                    """
-                    INSERT INTO py_nomina_funcionarios_publicos (
-                        payment_id,
-                    	anio,
-                    	mes,
-                    	codigo_persona,
-                    	codigo_nivel,
-                    	nivel_abr,
-                    	codigo_entidad,
-                    	entidad_abr,
-                    	programa_hash_id,
-                    	proyecto_hash_id,
-                    	unidad_responsable_hash_id,
-                    	codigo_objecto_gasto,
-                    	fuente_financiamiento,
-                    	linea,
-                    	codigo_categoria,
-                    	cargo,
-                    	horas_catedra,
-                    	fecha_ingreso,
-                        fecha_ingreso_txt,
-                    	antiguedad,
-                    	tipo_profesional,
-                    	lugar,
-                    	monto_presupuesto,
-                    	monto_devengado,
-                    	mes_corte,
-                    	anio_corte,
-                    	fecha_corte,
-                        fecha_corte_txt,
-                    	discapacidad,
-                    	check_sum
-                    )
-                    SELECT
-						CONCAT(
-							nc.anio,
-							LPAD(nc.mes::TEXT, 2, '0'),
-                        	'-',
-                            nc."codigoPersona",
-                    		'-',
-                    		ROW_NUMBER() OVER ( PARTITION BY nc.anio, nc.mes, nc."codigoPersona" )
-						),
-                    	nc.anio,
-                    	nc.mes,
-                    	nc."codigoPersona",
-                    	nc."codigoNivel",
-                    	TRIM(nc."nivelAbr"),
-                    	nc."codigoEntidad",
-                    	TRIM(nc."entidadAbr"),
-                    	encode(
-                            sha256(
-                        	    convert_to(
-                        	        CONCAT(
-                        		        nc."codigoPrograma"::TEXT,
-                        		        nc."codigoSubprograma"::TEXT,
-                        		        TRIM(nc."programaAbr"),
-                        		        TRIM(nc."subprogramaAbr"),
-                        		        TRIM(nc."descripcionPrograma"),
-                        		        TRIM(nc."descripcionSubprograma")
-                        	        ),
-                                    'UTF8'
-                        	    )
-                            ),
-                            'hex'
-                        ),
-                        encode(
-                            sha256(
-                        	    convert_to(
-                        	        CONCAT(
-                        		        nc."codigoProyecto",
-                    	                TRIM(nc."proyectoAbr"),
-                    	                TRIM(nc."descripcionProyecto")
-                        	        ),
-                                    'UTF8'
-                        	    )
-                            ),
-                            'hex'
-                        ),
-                        encode(
-                            sha256(
-                        	    convert_to(
-                        	        CONCAT(
-                        	        	nc."codigoUnidadResponsable",
-                        	        	TRIM(nc."unidadAbr"),
-                        	        	TRIM(nc."descripcionUnidadResponsable")
-                        	        ), 'UTF8'
-                        	    )
-                            ),
-                            'hex'
-                        ),
-                        nc."codigoObjetoGasto",
-                        TRIM(nc."fuenteFinanciamiento"),
-                        TRIM(nc.linea),
-                        TRIM(nc."codigoCategoria"),
-                        TRIM(nc.cargo),
-                        nc."horasCatedra",
-                        CASE
-                            WHEN (is_date(nc."fechaIngreso") AND TO_DATE(nc."fechaIngreso", 'YYYY-MM-DD') < CURRENT_DATE + 1)
-                            	THEN TO_DATE(nc."fechaIngreso", 'YYYY-MM-DD')
-                            ELSE NULL
-                        END,
-                        CASE
-                            WHEN (is_date(nc."fechaIngreso") AND TO_DATE(nc."fechaIngreso", 'YYYY-MM-DD') < CURRENT_DATE + 1) THEN NULL
-                            ELSE nc."fechaIngreso"
-                        END,
-                        CASE
-                            WHEN (is_date(nc."fechaIngreso") AND TO_DATE(nc."fechaIngreso", 'YYYY-MM-DD') < CURRENT_DATE + 1 AND nc.mes < 13) THEN (
-								DATE_PART(
-                        	    	'YEAR',
-                        	    	AGE(
-                        	    		make_date(nc.anio, nc.mes, 1) + INTERVAL '1 MONTH' - INTERVAL '1 DAY',
-                        	    		TO_DATE(nc."fechaIngreso", 'YYYY-MM-DD')
-                        	    	)
-                                )
-							)
-                            WHEN (is_date(nc."fechaIngreso") AND TO_DATE(nc."fechaIngreso", 'YYYY-MM-DD') < CURRENT_DATE + 1 AND nc.mes = 13) THEN (
-								DATE_PART(
-                        	    	'YEAR',
-                        	    	AGE(
-                        	    		make_date(nc.anio, nc.mes - 1, 1) + INTERVAL '1 MONTH' - INTERVAL '1 DAY',
-                        	    		TO_DATE(nc."fechaIngreso", 'YYYY-MM-DD')
-                        	    	)
-                                )
-							)
-                            ELSE NULL
-                        END,
-                        TRIM(nc."tipoPersonal"),
-                        TRIM(nc.lugar),
-                        nc."montoPresupuestado",
-                        nc."montoDevengado",
-                        nc."mesCorte",
-                        nc."anioCorte",
-                        CASE
-                            WHEN is_date(nc."fechaCorte") THEN TO_DATE(nc."fechaCorte", 'YYYY-MM-DD')
-                            ELSE NULL
-                        END,
-                        CASE
-                            WHEN is_date(nc."fechaCorte") THEN NULL
-                            ELSE nc."fechaCorte"
-                        END,
-                        CASE COALESCE(nc.discapacidad, 'OTHERS')
-                        	WHEN 'OTHERS' THEN NULL
-                        	WHEN 'N' THEN 'N'
-                        	WHEN 'S' THEN 'Y'
-                        	ELSE LEFT(nc.discapacidad, 1)
-                        END,
-                        encode(
-                        	sha256(
-                        		convert_to(
-                        			concat(
-                        				nc.anio::TEXT,
-                        				nc.mes::TEXT,
-                        				nc."codigoPersona",
-                        				nc."codigoNivel"::TEXT,
-                        				nc."nivelAbr",
-                        				nc."codigoEntidad"::TEXT,
-                        				nc."entidadAbr",
-                        				nc."codigoPrograma"::TEXT,
-                        				nc."codigoSubprograma"::TEXT,
-                        				TRIM(nc."programaAbr"),
-                                       	TRIM(nc."subprogramaAbr"),
-                                   		TRIM(nc."descripcionPrograma"),
-                                      	TRIM(nc."descripcionSubprograma"),
-                                      	nc."codigoProyecto",
-                    	               	TRIM(nc."proyectoAbr"),
-                    	               	TRIM(nc."descripcionProyecto"),
-                    	               	nc."codigoUnidadResponsable",
-                                       	TRIM(nc."unidadAbr"),
-                                       	TRIM(nc."descripcionUnidadResponsable"),
-                                       	nc."codigoObjetoGasto",
-                                       	nc."fuenteFinanciamiento",
-                                       	nc.linea,
-                                       	nc."codigoCategoria",
-                                       	nc.cargo,
-                                       	nc."horasCatedra"::TEXT,
-                                       	nc."fechaIngreso",
-                                       	nc."tipoPersonal",
-                                       	nc.lugar,
-                                       	nc."montoPresupuestado"::TEXT,
-                                       	nc."montoDevengado"::TEXT,
-                                       	nc."mesCorte"::TEXT,
-                                       	nc."anioCorte"::TEXT,
-                                       	nc."fechaCorte",
-                                       	nc.discapacidad
-                        			),
-                        			'UTF8'
-                        		)
-                        	),
-                        	'hex'
-                        )
-                    FROM
-                    	tmp_nomina_csv_raw nc
-                    ON CONFLICT (check_sum) DO NOTHING
-                    """
-                )
-                pbar.set_description(f"[{anio_mes}] loaded to nominas")
-            except Exception as e:
-                print(e)
+        with conn.cursor(row_factory=dict_row) as cur:
+            rs = cur.execute(
+                query, {"resource_url": resource_url, "check_sum": check_sum}
+            ).fetchone()
+            if rs is not None:
+                was_file_downloaded = rs["was_file_downloaded"]
+    return was_file_downloaded
 
 
-def download_zip_to_clickhouse(pbar: tqdm, anio_mes: str, csv_file: IO[bytes]):
-    pass
+def get_csv_file_size(file: IO[bytes]):
+    return len(file.read())
+
+
+def get_csv_file_entries(csv_with_io_wrapper: io.TextIOWrapper) -> int:
+    return sum(1 for _ in csv.reader(csv_with_io_wrapper))
+
+
+def get_csv_file_hash(file: IO[bytes]) -> str:
+    buffer_size = 4096
+    md5sum = hashlib.md5()
+    for chunk in iter(lambda: file.read(buffer_size), b''):
+        md5sum.update(chunk)
+    return md5sum.hexdigest()
+
+
+def download_zip_to_ch(pbar: tqdm, anio_mes: str, csv_with_io_wrapper: io.TextIOWrapper):
+    try:
+        pbar.set_description(f"[{anio_mes}] Initializing resources")
+
+        saved_personas = get_saved_personas(ch_client_mgr.client)
+        saved_niveles = get_saved_niveles(ch_client_mgr.client)
+        saved_entidades = get_saved_entidades(ch_client_mgr.client)
+        saved_programas = get_saved_programas(ch_client_mgr.client)
+        saved_proyectos = get_saved_proyectos(ch_client_mgr.client)
+        saved_unidad_responsables = get_saved_unidad_responsables(ch_client_mgr.client)
+        saved_objecto_gastos = get_saved_objecto_gastos(ch_client_mgr.client)
+        saved_pub_officers = get_saved_pub_officers(ch_client_mgr.client)
+
+        personas: Set[Persona] = set()
+        niveles: Set[Nivel] = set()
+        entidades: Set[Entidad] = set()
+        programs: Set[Programa] = set()
+        proyectos: Set[Proyecto] = set()
+        unidades: Set[UnidadResponsable] = set()
+        objecto_gastos: Set[ObjectoGasto] = set()
+        codigo_eventos: dict[str, int] = {}
+        pub_officers: Set[PubOfficer] = set()
+
+        pbar.set_description(f"[{anio_mes}] Reading csv file...")
+        reader = csv.DictReader(csv_with_io_wrapper)
+        pbar.set_description(f"[{anio_mes}] Preprocessing raw csv file...")
+        for row in tqdm(reader, desc=f"[{anio_mes}]"):
+            raw = from_dict(data_class=RawCsvItem, data=row)
+            codigo_evento = f"{raw.anio}{raw.mes}-{raw.codigoPersona}"
+            if codigo_evento in codigo_eventos.keys():
+                codigo_eventos[codigo_evento] += 1
+            else:
+                codigo_eventos[codigo_evento] = 0
+
+            if raw.codigoPersona not in saved_personas:
+                personas.add(to_persona(raw))
+
+            nivel_key = f"{raw.codigoNivel.strip()}-{raw.nivelAbr.strip()}"
+            if nivel_key not in saved_niveles:
+                niveles.add(to_nivel(nivel_key, raw))
+
+            entidad_key = f"{raw.codigoEntidad.strip()}-{raw.entidadAbr.strip()}"
+            if entidad_key not in saved_entidades:
+                entidades.add(to_entidad(entidad_key, raw))
+
+            program_key = f"{raw.codigoPrograma.strip()}-{raw.codigoSubprograma.strip()}-{raw.programaAbr.strip()}-{raw.subprogramaAbr.strip()}"
+            if program_key not in saved_programas:
+                programs.add(to_programa(program_key, raw))
+
+            proyecto_key = f"{raw.codigoProyecto.strip()}-{raw.proyectoAbr.strip()}"
+            if proyecto_key not in saved_proyectos:
+                proyectos.add(to_proyecto(proyecto_key, raw))
+
+            unidad_responsable_key = (
+                f"{raw.codigoUnidadResponsable.strip()}-{raw.unidadAbr.strip()}"
+            )
+            if unidad_responsable_key not in saved_unidad_responsables:
+                unidades.add(to_unidad_responsable(unidad_responsable_key, raw))
+
+            codigo_objecto_gasto = int(raw.codigoObjetoGasto.strip())
+            if codigo_objecto_gasto not in saved_objecto_gastos:
+                objecto_gastos.add(to_objecto_gasto(codigo_objecto_gasto, raw))
+
+            if f"{codigo_evento}{codigo_eventos[codigo_evento]}" not in saved_pub_officers:
+                pub_officers.add(to_pub_officer(raw, codigo_evento, codigo_eventos[codigo_evento]))
+        store_to_clickhouse(
+            ch_client_mgr.client,
+            ProcessedCsvItems(
+                personas=personas,
+                niveles=niveles,
+                entidades=entidades,
+                programas=programs,
+                proyectos=proyectos,
+                unidades=unidades,
+                objecto_gastos=objecto_gastos,
+                pub_officers=pub_officers,
+            ),
+        )
+    except Exception as e:
+        log.error(e)
 
 
 def sync_data_from_hecienda_py(dest: str):
     try:
-        log.info(f"Staring to sync data from {dest} to postgres...")
+        log.info(f"Staring to sync data from {dest} to local storage...")
         rq = backoff_get(dest=dest)
         if rq.status_code != 200:
             log.error(f"the hacienda api is not working well: [{rq.status_code}] {rq.text}")
@@ -517,14 +196,33 @@ def sync_data_from_hecienda_py(dest: str):
             for item in (pbar := tqdm(available_data)):
                 anio_mes = item["periodo"]
                 pbar.set_description(f"downloading nomina_{anio_mes}.zip")
-                rq = backoff_get(
-                    f"https://datos.hacienda.gov.py/odmh-core/rest/nomina/datos/nomina_{anio_mes}.zip"
-                )
+                resource_url = f"https://datos.hacienda.gov.py/odmh-core/rest/nomina/datos/nomina_{anio_mes}.zip"
+                rq = backoff_get(resource_url)
                 pbar.set_description("reading zip file")
                 with zipfile.ZipFile(io.BytesIO(rq.content)) as zf:
                     pbar.set_description("reading csv file")
+                    download_history = DownloadHistory(
+                        download_id=None,
+                        resource_url=resource_url,
+                        check_sum=None,
+                        entries=None,
+                        download_at_utc=None,
+                    )
                     with zf.open(f"nomina_{anio_mes}.csv", "r") as csv_file:
-                        download_zip_to_pg(pbar, anio_mes, csv_file)
+                        file_hash = get_csv_file_hash(csv_file)
+                        download_history.check_sum = file_hash
+                        if was_file_downloaded(resource_url, file_hash):
+                            continue
+
+                    with zf.open(f"nomina_{anio_mes}.csv", "r") as csv_file:
+                        csv_with_io_wrapper = io.TextIOWrapper(csv_file, "iso-8859-1")
+                        download_history.entries = get_csv_file_entries(csv_with_io_wrapper)
+
+                    with zf.open(f"nomina_{anio_mes}.csv", "r") as csv_file:
+                        csv_with_io_wrapper = io.TextIOWrapper(csv_file, "iso-8859-1")
+                        download_zip_to_ch(pbar, anio_mes, csv_with_io_wrapper)
+                        insert_download_history(download_history)
+
         else:
             log.error(
                 f"the response of the hacienda api is not a list of zip files: [{rq.status_code}] {rq.text}"
@@ -535,30 +233,11 @@ def sync_data_from_hecienda_py(dest: str):
         log.error(f"Error occured upon synchronizing data from hacienda api: {e}")
 
 
-def test_clickhoust():
-    with zipfile.ZipFile("nomina-2023-11.zip", mode="r") as zf:
-        with zf.open(f"nomina_2023-11.csv", "r") as csv_file:
-            reader = csv.reader(io.TextIOWrapper(csv_file, 'iso-8859-1'))
-            read = 0
-            read_max = 10
-            for row in reader:
-                print(row)
-                read += 1
-                if read > read_max:
-                    break
-
-
 if __name__ == '__main__':
     log.info("Welcome to nominas-py")
-    if app_config.pg is not None:
-        try:
-            pgpool_mgr.start(app_config.pg.to_conn_str())
-            sync_data_from_hecienda_py(app_config.nominas.resource)
-        finally:
-            pgpool_mgr.teardown()
-    elif app_config.ch is not None:
-        try:
-            ch_client_mgr.start(app_config.ch)
-            test_clickhoust()
-        finally:
-            ch_client_mgr.teardown()
+    try:
+        pgpool_mgr.start(app_config.pg.to_conn_str())
+        ch_client_mgr.start(app_config.ch)
+        sync_data_from_hecienda_py(app_config.nominas.resource)
+    finally:
+        pgpool_mgr.teardown()

@@ -10,6 +10,7 @@ apscheduler = "*"
 psycopg = {version = "*", extras = ["binary", "pool"]}
 backoff = "*"
 clickhouse-connect = "*"
+dacite = "*"
 
 [dev-packages]
 pre-commit = "*"

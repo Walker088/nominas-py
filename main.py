@@ -61,6 +61,7 @@ log = logger().getLogger("Main")
 def backoff_get(dest: str):
     return requests.get(dest)
 
+buffer_size = 4096
 
 def was_file_downloaded(resource_url: str, check_sum: str) -> bool:
     was_file_downloaded = False
@@ -74,17 +75,33 @@ def was_file_downloaded(resource_url: str, check_sum: str) -> bool:
 	    	WHERE
 	    		resource_url = %(resource_url)s
 	    		AND check_sum = %(check_sum)s
+                AND stat = %(stat)s
 	    ) was_file_downloaded
     """
     with pgpool_mgr.pool.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             rs = cur.execute(
-                query, {"resource_url": resource_url, "check_sum": check_sum}
+                query, {"resource_url": resource_url, "check_sum": check_sum, "stat": "SUCCEED"}
             ).fetchone()
             if rs is not None:
                 was_file_downloaded = rs["was_file_downloaded"]
     return was_file_downloaded
 
+def get_downloaded_histories() -> list[str]:
+    query = """
+    SELECT
+    	h.resource_url
+    FROM
+    	py_nomina_download_history h
+    WHERE
+    	h.stat = 'SUCCEED'
+    GROUP BY
+    	resource_url
+    """
+    with pgpool_mgr.pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            rs = cur.execute(query).fetchall()
+            return [r["resource_url"] for r in rs]
 
 def get_csv_file_size(file: IO[bytes]):
     return len(file.read())
@@ -95,7 +112,6 @@ def get_csv_file_entries(csv_with_io_wrapper: io.TextIOWrapper) -> int:
 
 
 def get_csv_file_hash(file: IO[bytes]) -> str:
-    buffer_size = 4096
     md5sum = hashlib.md5()
     for chunk in iter(lambda: file.read(buffer_size), b''):
         md5sum.update(chunk)
@@ -167,7 +183,7 @@ def download_zip_to_ch(pbar: tqdm, anio_mes: str, csv_with_io_wrapper: io.TextIO
 
             if f"{codigo_evento}{codigo_eventos[codigo_evento]}" not in saved_pub_officers:
                 pub_officers.add(to_pub_officer(raw, codigo_evento, codigo_eventos[codigo_evento]))
-        store_to_clickhouse(
+        return store_to_clickhouse(
             ch_client_mgr.client,
             ProcessedCsvItems(
                 personas=personas,
@@ -184,7 +200,7 @@ def download_zip_to_ch(pbar: tqdm, anio_mes: str, csv_with_io_wrapper: io.TextIO
         log.error(e)
 
 
-def sync_data_from_hecienda_py(dest: str):
+def sync_data_from_hecienda_py(dest: str, force: bool):
     try:
         log.info(f"Staring to sync data from {dest} to local storage...")
         rq = backoff_get(dest=dest)
@@ -192,26 +208,32 @@ def sync_data_from_hecienda_py(dest: str):
             log.error(f"the hacienda api is not working well: [{rq.status_code}] {rq.text}")
             return
         available_data = rq.json()
+        downloaded_histories = get_downloaded_histories()
         if isinstance(available_data, list):
             for item in (pbar := tqdm(available_data)):
                 anio_mes = item["periodo"]
                 pbar.set_description(f"downloading nomina_{anio_mes}.zip")
                 resource_url = f"https://datos.hacienda.gov.py/odmh-core/rest/nomina/datos/nomina_{anio_mes}.zip"
+                if (resource_url in downloaded_histories and not force):
+                    pbar.set_description(f"skipping nomina_{anio_mes}.zip")
+                    continue
                 rq = backoff_get(resource_url)
-                pbar.set_description("reading zip file")
+                pbar.set_description(f"[{anio_mes}] reading zip file")
                 with zipfile.ZipFile(io.BytesIO(rq.content)) as zf:
-                    pbar.set_description("reading csv file")
+                    pbar.set_description(f"[{anio_mes}] unzipped csv file")
                     download_history = DownloadHistory(
                         download_id=None,
                         resource_url=resource_url,
                         check_sum=None,
                         entries=None,
                         download_at_utc=None,
+                        was_succeed=None,
                     )
                     with zf.open(f"nomina_{anio_mes}.csv", "r") as csv_file:
                         file_hash = get_csv_file_hash(csv_file)
                         download_history.check_sum = file_hash
                         if was_file_downloaded(resource_url, file_hash):
+                            pbar.set_description(f"skipping nomina_{anio_mes}.zip")
                             continue
 
                     with zf.open(f"nomina_{anio_mes}.csv", "r") as csv_file:
@@ -220,8 +242,14 @@ def sync_data_from_hecienda_py(dest: str):
 
                     with zf.open(f"nomina_{anio_mes}.csv", "r") as csv_file:
                         csv_with_io_wrapper = io.TextIOWrapper(csv_file, "iso-8859-1")
-                        download_zip_to_ch(pbar, anio_mes, csv_with_io_wrapper)
+                        download_history.was_succeed = download_zip_to_ch(pbar, anio_mes, csv_with_io_wrapper)
                         insert_download_history(download_history)
+
+                    if not download_history.was_succeed:
+                        with zf.open(f"nomina_{anio_mes}.csv", "r") as csv_file:
+                            with open(f"nomina_{anio_mes}.csv", "wb") as failed_file:
+                                for chunk in iter(lambda: csv_file.read(buffer_size), b''):
+                                    failed_file.write(chunk)
 
         else:
             log.error(
@@ -238,6 +266,6 @@ if __name__ == '__main__':
     try:
         pgpool_mgr.start(app_config.pg.to_conn_str())
         ch_client_mgr.start(app_config.ch)
-        sync_data_from_hecienda_py(app_config.nominas.resource)
+        sync_data_from_hecienda_py(app_config.nominas.resource, app_config.nominas.force_download)
     finally:
         pgpool_mgr.teardown()

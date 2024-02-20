@@ -9,3 +9,4 @@ class DownloadHistory:
     check_sum: str | None
     entries: int | None
     download_at_utc: dt | None
+    was_succeed: bool | None

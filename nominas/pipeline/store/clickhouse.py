@@ -6,7 +6,8 @@ from clickhouse_connect.driver.client import Client
 from nominas.pipeline.preprocess.types import ProcessedCsvItems
 
 
-def store_to_clickhouse(client: Client, st: ProcessedCsvItems):
+def store_to_clickhouse(client: Client, st: ProcessedCsvItems) -> bool:
+    was_succeed = False
     try:
         client.insert(
             table="py_hacienda_pub_officers",
@@ -175,7 +176,10 @@ def store_to_clickhouse(client: Client, st: ProcessedCsvItems):
                 "concepto_gasto",
             ],
         )
+
+        was_succeed = True
     except Exception as e:
         p = next(iter(st.pub_officers))
         print(e)
         print(f"Error on {p.anio}-{p.mes}")
+    return was_succeed

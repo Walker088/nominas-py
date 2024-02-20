@@ -30,7 +30,7 @@ class ClickhouseConf:
 class NominasConf:
     resource: str
     # st_month_year: str
-    # force_download: bool
+    force_download: bool
     enable_hisag: bool
 
 
@@ -78,7 +78,7 @@ def read_config(cf: pathlib.Path):
             "RESOURCE", "https://datos.hacienda.gov.py/odmh-core/rest/nomina/datos/"
         ),
         # st_month_year=read_nomina.get("ST_MONTH_YEAR", "2013-01"),
-        # force_download=read_nomina.get("FORCE_DOWNLOAD", False),
+        force_download=read_nomina.get("FORCE_DOWNLOAD", False),
         enable_hisag=read_nomina.get("ENABLE_HISAG", False),
     )
     conf: Config = Config(pg=pgconf, ch=clickhouse_conf, nominas=nomina_conf)
